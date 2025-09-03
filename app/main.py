@@ -1,87 +1,133 @@
-# app/main.py
-from fastapi import FastAPI, HTTPException, Request, Response, Body
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Body, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
-import base64, io, os, uuid, time
-import httpx
+from typing import Dict, Any, Optional
 from PIL import Image, ImageFile
+import base64, io, os, time, uuid, httpx
 
-from .utils_dna import (
-    load_image_bytes_from_pil, load_image_from_bytes,
-    iter_bits_chunks, bits_to_bytes, bytes_to_bits,
-    bits_to_dna, dna_to_bits
-)
-
+# Tăng khả năng chịu ảnh "lỗi nhẹ"
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-app = FastAPI(title="img2dna-simple", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(title="Simple DNA Mapping (Action 1)", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
 )
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
-API_KEY = os.getenv("API_KEY", "")  # optional
-JOB_TTL = int(os.getenv("JOB_TTL_SEC", "900"))  # 15min
+JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "900"))  # 15 phút
+API_KEY = os.getenv("API_KEY")  # nếu đặt, sẽ yêu cầu header x-api-key
 
-# In-memory job store: { job_id: {created, bytes_png, meta} }
+# In-memory store cho phiên: { job_id: {created, dna, bits, png_bytes, meta } }
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-def _enforce_api_key(req: Request):
-    if API_KEY and req.headers.get("x-api-key") != API_KEY:
+# ---------- tiện ích ----------
+def _enforce_api_key(request: Request):
+    if API_KEY and request.headers.get("x-api-key") != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-@app.head("/")
-async def head_root():
-    return Response(status_code=200)
-
-@app.get("/health")
-async def health():
-    # cleanup old jobs
+def _cleanup_jobs():
     now = time.time()
-    del_ids = [jid for jid, v in JOBS.items() if now - v.get("created", now) > JOB_TTL]
-    for jid in del_ids:
+    expired = [jid for jid, v in JOBS.items() if now - v.get("created", now) > JOB_TTL_SEC]
+    for jid in expired:
         JOBS.pop(jid, None)
-    return {"status": "ok", "active_jobs": len(JOBS)}
 
 def _decode_b64_any(s: str) -> bytes:
     s = s.strip()
-    if "," in s and s.lower().startswith("data:"):
+    if s.lower().startswith("data:") and "," in s:
         s = s.split(",", 1)[1]
+    # chuẩn
     try:
         return base64.b64decode(s, validate=True)
     except Exception:
-        # try urlsafe padding
+        # urlsafe fallback
         pad = "=" * (-len(s) % 4)
         try:
             return base64.urlsafe_b64decode(s + pad)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid base64 input")
+            raise HTTPException(status_code=400, detail="Invalid base64 image")
 
-# =============== ENCODE ===============
-@app.post("/encode_dna_start")
-async def encode_dna_start(
+def _image_to_png_bytes(raw: bytes, max_side: int = 256) -> bytes:
+    try:
+        im = Image.open(io.BytesIO(raw)).convert("RGBA")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image data")
+    if max_side and max(im.size) > max_side:
+        w, h = im.size
+        scale = max_side / max(w, h)
+        im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
+    bio = io.BytesIO()
+    im.save(bio, format="PNG")
+    return bio.getvalue()
+
+def _bytes_to_bits(b: bytes) -> str:
+    return "".join(f"{x:08b}" for x in b)
+
+def _bits_to_bytes(bits: str) -> bytes:
+    bits = "".join(ch for ch in bits if ch in "01")
+    if len(bits) % 8 != 0:
+        bits += "0" * (8 - (len(bits) % 8))
+    return bytes(int(bits[i:i+8], 2) for i in range(0, len(bits), 8))
+
+def _bits_to_dna(bits: str, order: str = "ACGT") -> str:
+    bits = "".join(ch for ch in bits if ch in "01")
+    lut = {"00": order[0], "01": order[1], "10": order[2], "11": order[3]}
+    if len(bits) % 2 != 0:
+        bits += "0"
+    out = []
+    for i in range(0, len(bits), 2):
+        out.append(lut[bits[i:i+2]])
+    return "".join(out)
+
+def _dna_to_bits(dna: str, order: str = "ACGT") -> str:
+    dna = "".join(ch for ch in dna.upper() if ch in "ACGT")
+    rev = {order[0]:"00", order[1]:"01", order[2]:"10", order[3]:"11"}
+    try:
+        return "".join(rev[ch] for ch in dna)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base {e}")
+
+# ---------- endpoints ----------
+@app.head("/")
+async def head_root():
+    return Response(status_code=200)
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse("<h2>Simple DNA Mapping (Action 1)</h2><p>Use <a href='/docs'>/docs</a>.</p>")
+
+@app.get("/health")
+async def health():
+    _cleanup_jobs()
+    return {"status": "ok", "active_jobs": len(JOBS)}
+
+@app.post("/encode_simple_json")
+async def encode_simple_json(
     request: Request,
-    payload: dict = Body(...)
+    payload: dict = Body(..., description="Provide image_b64 or image_url"),
 ):
-    """Start an encode job: load image (b64 or URL), downscale, store PNG bytes, return job_id + meta."""
+    """
+    JSON-first: ảnh → PNG → bits → DNA (simple mapping).
+    Trả về: job_id, 50 nt đầu, độ dài, và URL tải .txt (dna/bits).
+    """
     _enforce_api_key(request)
-    img_b64 = payload.get("image_b64")
-    img_url = payload.get("image_url")
-    max_side = int(payload.get("max_side", 256))
-    mapping_order = payload.get("mapping_order", "ACGT")
-    chunk_bits = int(payload.get("chunk_bits", 16384))  # ~2KB per chunk (bits->dna ~ 8192 bases)
+    _cleanup_jobs()
 
-    if not img_b64 and not img_url:
+    image_b64 = payload.get("image_b64")
+    image_url = payload.get("image_url")
+    mapping_order = payload.get("mapping_order", "ACGT")
+    max_side = int(payload.get("max_side", 256))
+
+    if not image_b64 and not image_url:
         raise HTTPException(status_code=400, detail="Provide image_b64 or image_url")
 
-    # load bytes
-    if img_b64:
-        raw = _decode_b64_any(img_b64)
+    # lấy bytes ảnh
+    if image_b64:
+        raw = _decode_b64_any(image_b64)
     else:
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(img_url)
+            async with httpx.AsyncClient(timeout=12) as client:
+                r = await client.get(image_url)
                 r.raise_for_status()
                 raw = r.content
         except Exception:
@@ -90,134 +136,103 @@ async def encode_dna_start(
     if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large")
 
-    # Validate & normalize to PNG bytes (downscale)
-    try:
-        pil = Image.open(io.BytesIO(raw))
-        png_bytes = load_image_bytes_from_pil(pil, max_side=max_side)
-        pil2 = Image.open(io.BytesIO(png_bytes))
-        w, h = pil2.size
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image data")
+    png_bytes = _image_to_png_bytes(raw, max_side=max_side)
+    bits = _bytes_to_bits(png_bytes)
+    dna = _bits_to_dna(bits, order=mapping_order)
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {
         "created": time.time(),
-        "bytes_png": png_bytes,
-        "meta": {"width": w, "height": h, "mapping_order": mapping_order, "chunk_bits": chunk_bits},
+        "png_bytes": png_bytes,
+        "bits": bits,
+        "dna": dna,
+        "meta": {"mapping_order": mapping_order, "max_side": max_side}
     }
 
-    # Preview small (first chunk) without computing all
-    # Compute first chunk of bits and dna:
-    chunks = []
-    for ch in iter_bits_chunks(png_bytes, chunk_bits):
-        chunks.append(ch)
-        break
-    preview_bits = chunks[0] if chunks else ""
-    preview_dna = bits_to_dna(preview_bits, mapping_order=mapping_order) if preview_bits else ""
-
-    total_bits = len(png_bytes) * 8
-    num_chunks = (total_bits + chunk_bits - 1) // chunk_bits
-    total_bases = (total_bits + 1) // 2  # 2 bits per base
+    # tạo URL tải file
+    dna_url = str(request.url_for("download_dna", job_id=job_id))
+    bits_url = str(request.url_for("download_bits", job_id=job_id))
+    meta_url = str(request.url_for("download_meta", job_id=job_id))
+    image_url_norm = str(request.url_for("download_image", job_id=job_id))
 
     return {
         "job_id": job_id,
-        "meta": {"width": w, "height": h, "mapping_order": mapping_order, "chunk_bits": chunk_bits},
-        "size_bytes": len(png_bytes),
-        "total_bits": total_bits,
-        "total_bases": total_bases,
-        "num_chunks": num_chunks,
-        "preview": {"bits": preview_bits[:256], "dna": preview_dna[:128]}
+        "mapping_order": mapping_order,
+        "max_side": max_side,
+        "bits_len": len(bits),
+        "dna_len": len(dna),
+        "dna_head_50": dna[:50],
+        "downloads": {
+            "dna_txt": dna_url,
+            "bits_txt": bits_url,
+            "meta_json": meta_url,
+            "normalized_png": image_url_norm
+        }
     }
 
-@app.get("/encode_dna_chunk")
-async def encode_dna_chunk(
-    request: Request,
-    job_id: str,
-    kind: str = "dna",            # "dna" or "binary"
-    index: int = 0,
-    encoding: str = "text"        # "text" or "gzip_b64" (gzip is optional, left as future)
-):
-    """Get chunk i (0-based) of DNA or binary bits for a job_id."""
-    _enforce_api_key(request)
+@app.get("/job/{job_id}/dna.txt")
+async def download_dna(job_id: str):
     job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job_id not found or expired")
+    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    return PlainTextResponse(
+        content=job["dna"],
+        headers={"Content-Disposition": "attachment; filename=dna.txt"}
+    )
 
-    data = job["bytes_png"]
-    chunk_bits = job["meta"]["chunk_bits"]
-    mapping_order = job["meta"]["mapping_order"]
-    total_bits = len(data) * 8
-    num_chunks = (total_bits + chunk_bits - 1) // chunk_bits
-    if index < 0 or index >= num_chunks:
-        raise HTTPException(status_code=400, detail="index out of range")
+@app.get("/job/{job_id}/bits.txt")
+async def download_bits(job_id: str):
+    job = JOBS.get(job_id)
+    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    return PlainTextResponse(
+        content=job["bits"],
+        headers={"Content-Disposition": "attachment; filename=bits.txt"}
+    )
 
-    # iterate to the target chunk
-    i = 0
-    chosen = None
-    for ch in iter_bits_chunks(data, chunk_bits):
-        if i == index:
-            chosen = ch
-            break
-        i += 1
+@app.get("/job/{job_id}/meta.json")
+async def download_meta(job_id: str):
+    job = JOBS.get(job_id)
+    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    return JSONResponse(
+        content=job["meta"],
+        headers={"Content-Disposition": "attachment; filename=meta.json"}
+    )
 
-    if chosen is None:
-        raise HTTPException(status_code=500, detail="internal chunk error")
+@app.get("/job/{job_id}/image.png")
+async def download_image(job_id: str):
+    job = JOBS.get(job_id)
+    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    return Response(
+        content=job["png_bytes"],
+        media_type="image/png",
+        headers={"Content-Disposition": "inline; filename=image.png"}
+    )
 
-    if kind == "binary":
-        out = chosen
-    elif kind == "dna":
-        out = bits_to_dna(chosen, mapping_order=mapping_order)
-    else:
-        raise HTTPException(status_code=400, detail="kind must be 'dna' or 'binary'")
-
-    return {"job_id": job_id, "kind": kind, "index": index, "last": index == num_chunks - 1, "chunk": out, "encoding": encoding}
-
-# =============== DECODE ===============
-@app.post("/decode_dna")
-async def decode_dna(
+@app.post("/decode_simple_json")
+async def decode_simple_json(
     request: Request,
-    payload: dict = Body(...)
+    payload: dict = Body(..., description="Provide dna_text or bits_text; or dna_url/bits_url"),
 ):
     """
-    Decode back to image from:
-    - 'binary_bits' (text) or
-    - 'dna_text' (text) with optional 'mapping_order' (default 'ACGT').
-    Returns: { image_png_b64 }
+    JSON-first: DNA hoặc bits → ảnh PNG (base64).
+    Hỗ trợ đọc text trực tiếp (dna_text/bits_text) hoặc lấy qua URL (dna_url/bits_url).
     """
     _enforce_api_key(request)
-    binary_bits = payload.get("binary_bits")
-    dna_text = payload.get("dna_text")
+    dna_text: Optional[str] = payload.get("dna_text")
+    bits_text: Optional[str] = payload.get("bits_text")
+    dna_url: Optional[str] = payload.get("dna_url")
+    bits_url: Optional[str] = payload.get("bits_url")
     mapping_order = payload.get("mapping_order", "ACGT")
 
-    if not binary_bits and not dna_text:
-        raise HTTPException(status_code=400, detail="Provide binary_bits or dna_text")
+    if not any([dna_text, bits_text, dna_url, bits_url]):
+        raise HTTPException(status_code=400, detail="Provide dna_text/bits_text or dna_url/bits_url")
 
-    if dna_text and not binary_bits:
+    # lấy nội dung nếu là URL
+    async def fetch_text(url: str) -> str:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.text
+
+    if dna_text is None and dna_url:
         try:
-            binary_bits = dna_to_bits(dna_text, mapping_order=mapping_order)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"DNA parse error: {e}")
-
-    # build bytes
-    try:
-        img_bytes = bits_to_bytes(binary_bits)
-        # Optional: you may validate it's a PNG we created.
-        # But the bitstream is exactly the PNG file saved in encode stage.
-        b64 = base64.b64encode(img_bytes).decode("ascii")
-        return {"image_png_b64": b64}
-    except Exception:
-        raise HTTPException(status_code=400, detail="Cannot rebuild image from bits")
-
-@app.post("/decode_from_job")
-async def decode_from_job(
-    request: Request,
-    payload: dict = Body(...)
-):
-    """Shortcut decode using stored original PNG (no need to send big sequences)."""
-    _enforce_api_key(request)
-    job_id = payload.get("job_id")
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="job_id not found or expired")
-    b64 = base64.b64encode(job["bytes_png"]).decode("ascii")
-    return {"image_png_b64": b64}
+            dna_text = awai_
