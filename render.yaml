@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: img2dna-simple
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: MAX_UPLOAD_MB
+        value: "12"
+      - key: JOB_TTL_SEC
+        value: "900"
+      # - key: API_KEY
+      #   value: "your-secret"  # nếu muốn buộc header x-api-key
