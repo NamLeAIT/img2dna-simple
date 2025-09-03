@@ -11,14 +11,17 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 app = FastAPI(title="Simple DNA Mapping (Action 1)", version="1.0.0", docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=True
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True
 )
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
 JOB_TTL_SEC = int(os.getenv("JOB_TTL_SEC", "900"))  # 15 phút
 API_KEY = os.getenv("API_KEY")  # nếu đặt, sẽ yêu cầu header x-api-key
 
-# In-memory store cho phiên: { job_id: {created, dna, bits, png_bytes, meta } }
+# In-memory store: { job_id: {created, dna, png_bytes, recon_png_bytes?, meta } }
 JOBS: Dict[str, Dict[str, Any]] = {}
 
 # ---------- tiện ích ----------
@@ -107,8 +110,8 @@ async def encode_simple_json(
     payload: dict = Body(..., description="Provide image_b64 or image_url"),
 ):
     """
-    JSON-first: ảnh → PNG → bits → DNA (simple mapping).
-    Trả về: job_id, 50 nt đầu, độ dài, và URL tải .txt (dna/bits).
+    Ảnh → PNG → bits → DNA (simple mapping).
+    Trả về: job_id, 50 nt đầu, độ dài, và URL tải .txt DNA (kèm PNG chuẩn hoá).
     """
     _enforce_api_key(request)
     _cleanup_jobs()
@@ -144,28 +147,22 @@ async def encode_simple_json(
     JOBS[job_id] = {
         "created": time.time(),
         "png_bytes": png_bytes,
-        "bits": bits,
         "dna": dna,
         "meta": {"mapping_order": mapping_order, "max_side": max_side}
     }
 
-    # tạo URL tải file
+    # URL tải file
     dna_url = str(request.url_for("download_dna", job_id=job_id))
-    bits_url = str(request.url_for("download_bits", job_id=job_id))
-    meta_url = str(request.url_for("download_meta", job_id=job_id))
     image_url_norm = str(request.url_for("download_image", job_id=job_id))
 
     return {
         "job_id": job_id,
         "mapping_order": mapping_order,
         "max_side": max_side,
-        "bits_len": len(bits),
         "dna_len": len(dna),
         "dna_head_50": dna[:50],
         "downloads": {
             "dna_txt": dna_url,
-            "bits_txt": bits_url,
-            "meta_json": meta_url,
             "normalized_png": image_url_norm
         }
     }
@@ -173,60 +170,42 @@ async def encode_simple_json(
 @app.get("/job/{job_id}/dna.txt")
 async def download_dna(job_id: str):
     job = JOBS.get(job_id)
-    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found or expired")
     return PlainTextResponse(
         content=job["dna"],
-        headers={"Content-Disposition": "attachment; filename=dna.txt"}
-    )
-
-@app.get("/job/{job_id}/bits.txt")
-async def download_bits(job_id: str):
-    job = JOBS.get(job_id)
-    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
-    return PlainTextResponse(
-        content=job["bits"],
-        headers={"Content-Disposition": "attachment; filename=bits.txt"}
-    )
-
-@app.get("/job/{job_id}/meta.json")
-async def download_meta(job_id: str):
-    job = JOBS.get(job_id)
-    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
-    return JSONResponse(
-        content=job["meta"],
-        headers={"Content-Disposition": "attachment; filename=meta.json"}
+        headers={"Content-Disposition": "attachment; filename=\"dna.txt\""}
     )
 
 @app.get("/job/{job_id}/image.png")
 async def download_image(job_id: str):
     job = JOBS.get(job_id)
-    if not job: raise HTTPException(status_code=404, detail="job not found or expired")
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found or expired")
     return Response(
         content=job["png_bytes"],
         media_type="image/png",
-        headers={"Content-Disposition": "inline; filename=image.png"}
+        headers={"Content-Disposition": "inline; filename=\"image.png\""}
     )
 
 @app.post("/decode_simple_json")
 async def decode_simple_json(
     request: Request,
-    payload: dict = Body(..., description="Provide dna_text or bits_text; or dna_url/bits_url"),
+    payload: dict = Body(..., description="Provide dna_text or dna_url"),
 ):
     """
-    JSON-first: DNA hoặc bits → ảnh PNG (base64).
-    Hỗ trợ đọc text trực tiếp (dna_text/bits_text) hoặc lấy qua URL (dna_url/bits_url).
+    DNA (A/C/G/T) → Ảnh PNG (base64) + link tải file PNG.
+    Hỗ trợ: dna_text trực tiếp hoặc dna_url.
     """
     _enforce_api_key(request)
+
     dna_text: Optional[str] = payload.get("dna_text")
-    bits_text: Optional[str] = payload.get("bits_text")
     dna_url: Optional[str] = payload.get("dna_url")
-    bits_url: Optional[str] = payload.get("bits_url")
     mapping_order = payload.get("mapping_order", "ACGT")
 
-    if not any([dna_text, bits_text, dna_url, bits_url]):
-        raise HTTPException(status_code=400, detail="Provide dna_text/bits_text or dna_url/bits_url")
+    if not dna_text and not dna_url:
+        raise HTTPException(status_code=400, detail="Provide dna_text or dna_url")
 
-    # lấy nội dung nếu là URL
     async def fetch_text(url: str) -> str:
         async with httpx.AsyncClient(timeout=12) as client:
             r = await client.get(url)
@@ -235,4 +214,44 @@ async def decode_simple_json(
 
     if dna_text is None and dna_url:
         try:
-            dna_text = awai_
+            dna_text = await fetch_text(dna_url)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Cannot fetch dna_url")
+
+    # Clean DNA & chuyển về bits
+    dna_clean = "".join(ch for ch in (dna_text or "").upper() if ch in "ACGT")
+    if not dna_clean:
+        raise HTTPException(status_code=400, detail="Invalid DNA text")
+    bits = _dna_to_bits(dna_clean, order=mapping_order)
+
+    # bits -> bytes -> ảnh
+    img_bytes = _bits_to_bytes(bits)
+    # xác thực ảnh PNG
+    try:
+        _ = Image.open(io.BytesIO(img_bytes)).size
+    except Exception:
+        raise HTTPException(status_code=400, detail="Rebuilt bytes are not a valid image")
+
+    # Lưu job decode để tải file PNG
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"created": time.time(), "recon_png_bytes": img_bytes, "meta": {"mapping_order": mapping_order}}
+
+    png_b64 = base64.b64encode(img_bytes).decode("ascii")
+    recon_url = str(request.url_for("download_reconstructed", job_id=job_id))
+
+    return {
+        "job_id": job_id,
+        "image_png_b64": png_b64,
+        "downloads": { "reconstructed_png": recon_url }
+    }
+
+@app.get("/job/{job_id}/reconstructed.png")
+async def download_reconstructed(job_id: str):
+    job = JOBS.get(job_id)
+    if not job or "recon_png_bytes" not in job:
+        raise HTTPException(status_code=404, detail="reconstructed image not found or expired")
+    return Response(
+        content=job["recon_png_bytes"],
+        media_type="image/png",
+        headers={"Content-Disposition": "attachment; filename=\"reconstructed.png\""}
+    )
